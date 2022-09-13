@@ -1,150 +1,188 @@
-var prefix      = 'sd',
-    Filters     = require('./filters'),
-    Directives  = require('./directives'),
-    selector    = Object.keys(Directives).map(function (d) {
-        return '[' + prefix + '-' + d + ']'
-    }).join()
-
-function Seed (opts) {
-
-    var self = this,
-        root = this.el = document.getElementById(opts.id),
-        els  = root.querySelectorAll(selector),
-        bindings = {} // internal real data
-
-    self.scope = {} // external interface
-
-    // process nodes for directives
-    ;[].forEach.call(els, processNode)
-    processNode(root)
-
-    // initialize all variables by invoking setters
-    for (var key in bindings) {
-        self.scope[key] = opts.scope[key]
+var config      = require('./config'),
+    ViewModel   = require('./viewmodel'),
+    utils       = require('./utils'),
+    makeHash    = utils.hash,
+    assetTypes  = ['directive', 'filter', 'partial', 'effect', 'component'],
+    // Internal modules that are exposed for plugins
+    pluginAPI   = {
+        utils: utils,
+        config: config,
+        transition: require('./transition'),
+        observer: require('./observer')
     }
 
-    function processNode (el) {
-        cloneAttributes(el.attributes).forEach(function (attr) {
-            var directive = parseDirective(attr)
-            if (directive) {
-                bindDirective(self, el, bindings, directive)
-            }
-        })
-    }
+ViewModel.options = config.globalAssets = {
+    directives  : require('./directives'),
+    filters     : require('./filters'),
+    partials    : makeHash(),
+    effects     : makeHash(),
+    components  : makeHash()
 }
 
-// clone attributes so they don't change
-function cloneAttributes (attributes) {
-    return [].map.call(attributes, function (attr) {
-        return {
-            name: attr.name,
-            value: attr.value
+/**
+ *  Expose asset registration methods
+ */
+assetTypes.forEach(function (type) {
+    ViewModel[type] = function (id, value) {
+        var hash = this.options[type + 's']
+        if (!hash) {
+            hash = this.options[type + 's'] = makeHash()
         }
-    })
-}
-
-function bindDirective (seed, el, bindings, directive) {
-    el.removeAttribute(directive.attr.name)
-    var key = directive.key,
-        binding = bindings[key]
-    if (!binding) {
-        bindings[key] = binding = {
-            value: undefined,
-            directives: []
+        if (!value) return hash[id]
+        if (type === 'partial') {
+            value = utils.parseTemplateOption(value)
+        } else if (type === 'component') {
+            value = utils.toConstructor(value)
+        } else if (type === 'filter') {
+            utils.checkFilter(value)
         }
+        hash[id] = value
+        return this
     }
-    directive.el = el
-    binding.directives.push(directive)
-    // invoke bind hook if exists
-    if (directive.bind) {
-        directive.bind(el, binding.value)
-    }
-    if (!seed.scope.hasOwnProperty(key)) {
-        bindAccessors(seed, key, binding)
-    }
-}
+})
 
-function bindAccessors (seed, key, binding) {
-    Object.defineProperty(seed.scope, key, {
-        get: function () {
-            return binding.value
-        },
-        set: function (value) {
-            binding.value = value
-            binding.directives.forEach(function (directive) {
-                if (value && directive.filters) {
-                    value = applyFilters(value, directive)
-                }
-                directive.update(
-                    directive.el,
-                    value,
-                    directive.argument,
-                    directive,
-                    seed
-                )
-            })
+/**
+ *  Set config options
+ */
+ViewModel.config = function (opts, val) {
+    if (typeof opts === 'string') {
+        if (val === undefined) {
+            return config[opts]
+        } else {
+            config[opts] = val
         }
-    })
-}
-
-function parseDirective (attr) {
-
-    if (attr.name.indexOf(prefix) === -1) return
-
-    // parse directive name and argument
-    var noprefix = attr.name.slice(prefix.length + 1),
-        argIndex = noprefix.indexOf('-'),
-        dirname  = argIndex === -1
-            ? noprefix
-            : noprefix.slice(0, argIndex),
-        def = Directives[dirname],
-        arg = argIndex === -1
-            ? null
-            : noprefix.slice(argIndex + 1)
-
-    // parse scope variable key and pipe filters
-    var exp = attr.value,
-        pipeIndex = exp.indexOf('|'),
-        key = pipeIndex === -1
-            ? exp.trim()
-            : exp.slice(0, pipeIndex).trim(),
-        filters = pipeIndex === -1
-            ? null
-            : exp.slice(pipeIndex + 1).split('|').map(function (filter) {
-                return filter.trim()
-            })
-
-    return def
-        ? {
-            attr: attr,
-            key: key,
-            filters: filters,
-            definition: def,
-            argument: arg,
-            update: typeof def === 'function'
-                ? def
-                : def.update
-        }
-        : null
-}
-
-function applyFilters (value, directive) {
-    if (directive.definition.customFilter) {
-        return directive.definition.customFilter(value, directive.filters)
     } else {
-        directive.filters.forEach(function (filter) {
-            if (Filters[filter]) {
-                value = Filters[filter](value)
-            }
-        })
-        return value
+        utils.extend(config, opts)
     }
+    return this
 }
 
-module.exports = {
-    create: function (opts) {
-        return new Seed(opts)
-    },
-    filters: Filters,
-    directives: Directives
+/**
+ *  Expose an interface for plugins
+ */
+ViewModel.use = function (plugin) {
+    if (typeof plugin === 'string') {
+        try {
+            plugin = require(plugin)
+        } catch (e) {
+            utils.warn('Cannot find plugin: ' + plugin)
+            return
+        }
+    }
+
+    // additional parameters
+    var args = [].slice.call(arguments, 1)
+    args.unshift(this)
+
+    if (typeof plugin.install === 'function') {
+        plugin.install.apply(plugin, args)
+    } else {
+        plugin.apply(null, args)
+    }
+    return this
 }
+
+/**
+ *  Expose internal modules for plugins
+ */
+ViewModel.require = function (module) {
+    return pluginAPI[module]
+}
+
+ViewModel.extend = extend
+ViewModel.nextTick = utils.nextTick
+
+/**
+ *  Expose the main ViewModel class
+ *  and add extend method
+ */
+function extend (options) {
+
+    var ParentVM = this
+
+    // extend data options need to be copied
+    // on instantiation
+    if (options.data) {
+        options.defaultData = options.data
+        delete options.data
+    }
+
+    // inherit options
+    // but only when the super class is not the native Vue.
+    if (ParentVM !== ViewModel) {
+        options = inheritOptions(options, ParentVM.options, true)
+    }
+    utils.processOptions(options)
+
+    var ExtendedVM = function (opts, asParent) {
+        if (!asParent) {
+            opts = inheritOptions(opts, options, true)
+        }
+        ParentVM.call(this, opts, true)
+    }
+
+    // inherit prototype props
+    var proto = ExtendedVM.prototype = Object.create(ParentVM.prototype)
+    utils.defProtected(proto, 'constructor', ExtendedVM)
+
+    // allow extended VM to be further extended
+    ExtendedVM.extend  = extend
+    ExtendedVM.super   = ParentVM
+    ExtendedVM.options = options
+
+    // allow extended VM to add its own assets
+    assetTypes.forEach(function (type) {
+        ExtendedVM[type] = ViewModel[type]
+    })
+
+    // allow extended VM to use plugins
+    ExtendedVM.use     = ViewModel.use
+    ExtendedVM.require = ViewModel.require
+
+    return ExtendedVM
+}
+
+/**
+ *  Inherit options
+ *
+ *  For options such as `data`, `vms`, `directives`, 'partials',
+ *  they should be further extended. However extending should only
+ *  be done at top level.
+ *  
+ *  `proto` is an exception because it's handled directly on the
+ *  prototype.
+ *
+ *  `el` is an exception because it's not allowed as an
+ *  extension option, but only as an instance option.
+ */
+function inheritOptions (child, parent, topLevel) {
+    child = child || {}
+    if (!parent) return child
+    for (var key in parent) {
+        if (key === 'el') continue
+        var val = child[key],
+            parentVal = parent[key]
+        if (topLevel && typeof val === 'function' && parentVal) {
+            // merge hook functions into an array
+            child[key] = [val]
+            if (Array.isArray(parentVal)) {
+                child[key] = child[key].concat(parentVal)
+            } else {
+                child[key].push(parentVal)
+            }
+        } else if (
+            topLevel &&
+            (utils.isTrueObject(val) || utils.isTrueObject(parentVal))
+            && !(parentVal instanceof ViewModel)
+        ) {
+            // merge toplevel object options
+            child[key] = inheritOptions(val, parentVal)
+        } else if (val === undefined) {
+            // inherit if child doesn't override
+            child[key] = parentVal
+        }
+    }
+    return child
+}
+
+module.exports = ViewModel
